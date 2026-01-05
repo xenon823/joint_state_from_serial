@@ -1,61 +1,188 @@
 #!/usr/bin/env python3
+# ======================================================
+# joint_state_from_serial.py
+#
+# 功能：
+#   - 從下位機（ESP32）透過 Serial 接收六軸關節角度（degree）
+#   - 轉換為 ROS 標準 JointState（radian）
+#   - 發布到 /joint_states，供 robot_state_publisher 使用
+#
+# 串口格式（必須）：
+#   joint1,joint2,joint3,joint4,joint5,joint6;
+#   單位：degree
+#
+# 發布頻率：
+#   50 Hz（由 ROS Timer 控制）
+#
+# ======================================================
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 import serial
+import math
+import time
+
 
 class JointStateFromSerial(Node):
+    """
+    ROS2 Node：
+      - 負責橋接「Serial → /joint_states」
+      - 是整個機械臂 TF / RViz / MoveIt 的資料來源
+    """
+
     def __init__(self):
+        # 初始化 ROS Node，名稱為 joint_state_from_serial
         super().__init__('joint_state_from_serial')
 
+        # --------------------------------------------------
+        # ROS Publisher
+        # --------------------------------------------------
+        # 發布 sensor_msgs/JointState 到 /joint_states
         self.pub = self.create_publisher(JointState, '/joint_states', 10)
 
-        self.ser = serial.Serial('/dev/arm_j123', 115200, timeout=0.1)
+        # --------------------------------------------------
+        # Serial 設定
+        # --------------------------------------------------
+        # 嘗試開啟下位機的 serial port
+        try:
+            self.ser = serial.Serial('/dev/arm_j123', 115200, timeout=0.1)
+            self.get_logger().info('Serial connected: /dev/arm_j123')
+        except serial.SerialException as e:
+            # 若開啟失敗，node 不會崩潰，但停止發佈資料
+            self.get_logger().error(f'Serial open failed: {e}')
+            self.ser = None
 
+        # --------------------------------------------------
+        # 關節名稱（必須與 URDF 完全一致）
+        # --------------------------------------------------
         self.joint_names = [
             'joint1', 'joint2', 'joint3',
             'joint4', 'joint5', 'joint6'
         ]
 
-        self.timer = self.create_timer(0.02, self.update)  # 50 Hz
+        # --------------------------------------------------
+        # Watchdog（通訊監控）
+        # --------------------------------------------------
+        # 記錄最後一次成功接收到資料的時間
+        self.last_rx_time = time.time()
 
+        # 超過此時間（秒）沒資料 → 視為通訊異常
+        self.timeout_sec = 0.5  # 500 ms
+
+        # --------------------------------------------------
+        # ROS Timer
+        # --------------------------------------------------
+        # 每 0.02 秒呼叫一次 update() → 50 Hz
+        self.timer = self.create_timer(0.02, self.update)
+
+    # ======================================================
+    # 定時回呼：讀取 Serial 並發布 JointState
+    # ======================================================
     def update(self):
-        line = self.ser.readline().decode(errors='ignore').strip()
-        if not line:
+        # 若 serial 尚未成功開啟，直接返回
+        if self.ser is None:
             return
 
-        # ✅ 只吃「機器格式」
+        # 從 serial 讀取一行資料
+        line = self.ser.readline().decode(errors='ignore').strip()
+
+        # 若沒有資料，檢查是否 timeout
+        if not line:
+            self._check_timeout()
+            return
+
+        # --------------------------------------------------
+        # 基本格式檢查
+        # --------------------------------------------------
+
+        # 必須包含 ';' 作為封包結尾
         if ';' not in line:
             return
+
+        # 必須是數字或負號開頭（避免誤吃 debug 訊息）
         if not (line[0].isdigit() or line[0] == '-'):
             return
 
         try:
+            # --------------------------------------------------
+            # 解析角度資料
+            # --------------------------------------------------
+            # 取出 ';' 之前的部分
             angle_part = line.split(';')[0]
+
+            # 以 ',' 分割，轉成 float（degree）
             angles_deg = [float(x) for x in angle_part.split(',')]
 
-            if len(angles_deg) != 3:
+            # 必須是六軸資料
+            if len(angles_deg) != 6:
+                self.get_logger().warn(
+                    f'Expect 6 joints, got {len(angles_deg)}'
+                )
                 return
 
-            # 補成 6 軸（URDF 對齊）
-            angles_deg += [0.0, 0.0, 0.0]
+            # --------------------------------------------------
+            # 更新 watchdog（成功接收資料）
+            # --------------------------------------------------
+            self.last_rx_time = time.time()
 
+            # --------------------------------------------------
+            # Degree → Radian（ROS / URDF 標準）
+            # --------------------------------------------------
+            angles_rad = [a * math.pi / 180.0 for a in angles_deg]
+
+            # --------------------------------------------------
+            # 組裝 JointState 訊息
+            # --------------------------------------------------
             msg = JointState()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.name = self.joint_names
-            msg.position = [a * 3.1415926 / 180.0 for a in angles_deg]
 
+            # 關節名稱（順序必須對齊）
+            msg.name = self.joint_names
+
+            # 關節角度（radian）
+            msg.position = angles_rad
+
+            # 目前未使用速度與力矩，填 0
+            msg.velocity = [0.0] * 6
+            msg.effort   = [0.0] * 6
+
+            # 發布 /joint_states
             self.pub.publish(msg)
 
         except Exception as e:
-            self.get_logger().warn(f'parse error: {e}')
+            # 任何解析錯誤都只警告，不讓 node 掛掉
+            self.get_logger().warn(f'Parse error: {e}')
 
+    # ======================================================
+    # Watchdog：檢查是否超時未收到資料
+    # ======================================================
+    def _check_timeout(self):
+        # 若超過 timeout_sec 未收到資料，印出警告
+        if time.time() - self.last_rx_time > self.timeout_sec:
+            self.get_logger().warn('Serial timeout: no joint data')
+
+            # 重置時間，避免每個 timer 都刷 warning
+            self.last_rx_time = time.time()
+
+
+# ======================================================
+# ROS2 Node 入口點
+# ======================================================
 def main():
+    # 初始化 ROS2
     rclpy.init()
+
+    # 建立 Node
     node = JointStateFromSerial()
+
+    # 進入事件迴圈
     rclpy.spin(node)
+
+    # 清理資源
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
