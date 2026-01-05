@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+import serial
+
+class JointStateFromSerial(Node):
+    def __init__(self):
+        super().__init__('joint_state_from_serial')
+
+        self.pub = self.create_publisher(JointState, '/joint_states', 10)
+
+        self.ser = serial.Serial('/dev/arm_j123', 115200, timeout=0.1)
+
+        self.joint_names = [
+            'joint1', 'joint2', 'joint3',
+            'joint4', 'joint5', 'joint6'
+        ]
+
+        self.timer = self.create_timer(0.02, self.update)  # 50 Hz
+
+    def update(self):
+        line = self.ser.readline().decode(errors='ignore').strip()
+        if not line:
+            return
+
+        # ✅ 只吃「機器格式」
+        if ';' not in line:
+            return
+        if not (line[0].isdigit() or line[0] == '-'):
+            return
+
+        try:
+            angle_part = line.split(';')[0]
+            angles_deg = [float(x) for x in angle_part.split(',')]
+
+            if len(angles_deg) != 3:
+                return
+
+            # 補成 6 軸（URDF 對齊）
+            angles_deg += [0.0, 0.0, 0.0]
+
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.name = self.joint_names
+            msg.position = [a * 3.1415926 / 180.0 for a in angles_deg]
+
+            self.pub.publish(msg)
+
+        except Exception as e:
+            self.get_logger().warn(f'parse error: {e}')
+
+def main():
+    rclpy.init()
+    node = JointStateFromSerial()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
